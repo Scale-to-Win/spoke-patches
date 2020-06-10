@@ -1,0 +1,28 @@
+From 997dcd43db17edacc29221b1215ff40c1bcffa63 Mon Sep 17 00:00:00 2001
+From: Hiemanshu Sharma <hiemanshu@gmail.com>
+Date: Thu, 28 May 2020 21:28:51 +0530
+Subject: [PATCH] CSV S3 Import: Use batchInsert to add chunks
+
+---
+diff --git a/src/integrations/contact-loaders/helpers.js b/src/integrations/contact-loaders/helpers.js
+index fb211b4c..fc67b632 100644
+--- a/src/integrations/contact-loaders/helpers.js
++++ b/src/integrations/contact-loaders/helpers.js
+@@ -43,11 +43,9 @@ export const finalizeContactLoad = async (
+       index * chunkSize,
+       (index + 1) * chunkSize
+     );
+-    await CampaignContact.save(savePortion).catch(err => {
+-      // eslint-disable-next-line no-console
+-      console.error("Error saving campaign contacts:", campaignId, err);
+-      // call the error thing
+-    });
++
++    console.log(`Working on importing chunk No: ${index}`);
++    await r.knex.batchInsert("campaign_contact", savePortion);
+   }
+ 
+   await completeContactLoad(job, [], ingestDataReference, ingestResult);
+-- 
+2.21.0 (Apple Git-122)
+

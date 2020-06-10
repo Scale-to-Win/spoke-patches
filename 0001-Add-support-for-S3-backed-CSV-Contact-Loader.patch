@@ -1,0 +1,479 @@
+From ad0c2cd12f76c18f151b1b0fdb7c5a12b6b21868 Mon Sep 17 00:00:00 2001
+From: Hiemanshu Sharma <hiemanshu@gmail.com>
+Date: Wed, 27 May 2020 22:51:55 +0530
+Subject: [PATCH] Add support for S3 backed CSV Contact Loader
+
+---
+diff --git a/docs/REFERENCE-environment_variables.md b/docs/REFERENCE-environment_variables.md
+index 030b645f..3a4af9ce 100644
+--- a/docs/REFERENCE-environment_variables.md
++++ b/docs/REFERENCE-environment_variables.md
+@@ -10,6 +10,7 @@
+ | AWS_ACCESS_KEY_ID                                | AWS access key ID with access to S3 bucket, required for campaign exports outside Amazon Lambda.                                                                                                                                                                                                                                                                                            |
+ | AWS_SECRET_ACCESS_KEY                            | AWS access key secret with access to S3 bucket, required for campaign exports outside Amazon Lambda.                                                                                                                                                                                                                                                                                        |
+ | AWS_S3_BUCKET_NAME                               | Name of S3 bucket for saving campaign exports.                                                                                                                                                                                                                                                                                                                                              |
++| AWS_REGION                                       | Region of S3 bucket for saving campaign exports.                                                                                                                                                                                                                                                                                                                                        |
+ | BASE_URL                                         | The base URL of the website, without trailing slack, e.g. `https://example.org`, used to construct various URLs.                                                                                                                                                                                                                                                                            |
+ | CACHE_PREFIX                                     | If REDIS*URL is set, then this will prefix keys CACHE_PREFIX, which might be useful if multiple applications use the same redis server. \_Default*: "".                                                                                                                                                                                                                                     |
+ | CAMPAIGN_ID                                      | Campaign ID used by `dev-tools/export-query.js` to identify which campaign should be exported.                                                                                                                                                                                                                                                                                              |
+diff --git a/src/integrations/contact-loaders/csv-s3-upload/index.js b/src/integrations/contact-loaders/csv-s3-upload/index.js
+new file mode 100644
+index 00000000..2b8f71af
+--- /dev/null
++++ b/src/integrations/contact-loaders/csv-s3-upload/index.js
+@@ -0,0 +1,142 @@
++import { finalizeContactLoad } from "../helpers";
++import { unzipPayload } from "../../../workers/jobs";
++import { getConfig, hasConfig } from "../../../server/api/lib/config";
++import { gunzip } from "../../../lib";
++
++import AWS from "aws-sdk";
++
++export const name = "csv-s3-upload";
++
++export function displayName() {
++  return "S3 CSV Upload";
++}
++
++export function serverAdministratorInstructions() {
++  return {
++    environmentVariables: [
++      "AWS_ACCESS_KEY_ID",
++      "AWS_SECRET_ACCESS_KEY",
++      "AWS_S3_BUCKET_NAME",
++      "AWS_REGION"
++    ],
++    description: "CSV Upload a list of contacts to S3",
++    setupInstructions: "AWS S3 needs to be setup"
++  };
++}
++
++export async function available(organization, user) {
++  /// return an object with two keys: result: true/false
++  /// these keys indicate if the ingest-contact-loader is usable
++  /// Sometimes credentials need to be setup, etc.
++  /// A second key expiresSeconds: should be how often this needs to be checked
++  /// If this is instantaneous, you can have it be 0 (i.e. always), but if it takes time
++  /// to e.g. verify credentials or test server availability,
++  /// then it's better to allow the result to be cached
++  const result =
++    hasConfig("AWS_S3_BUCKET_NAME") &&
++    hasConfig("AWS_REGION") &&
++    hasConfig("AWS_ACCESS_KEY_ID") &&
++    hasConfig("AWS_SECRET_ACCESS_KEY");
++  return {
++    result: result,
++    expiresSeconds: 0
++  };
++}
++
++export function addServerEndpoints(expressApp) {
++  /// If you need to create API endpoints for server-to-server communication
++  /// this is where you would run e.g. app.post(....)
++  /// Be mindful of security and make sure there's
++  /// This is NOT where or how the client send or receive contact data
++  return;
++}
++
++export function clientChoiceDataCacheKey(organization, campaign, user) {
++  /// returns a string to cache getClientChoiceData -- include items that relate to cacheability
++  //return `${organization.id}-${campaign.id}`;
++  return "";
++}
++
++export async function getClientChoiceData(
++  organization,
++  campaign,
++  user,
++  loaders
++) {
++  /// data to be sent to the admin client to present options to the component or similar
++  /// The react-component will be sent this data as a property
++  /// return a json object which will be cached for expiresSeconds long
++  /// `data` should be a single string -- it can be JSON which you can parse in the client component
++  const s3 = new AWS.S3({
++    signatureVersion: "v4",
++    region: getConfig("AWS_REGION")
++  });
++  const key = `contacts-upload/${campaign.id}/contacts.json.gz`;
++
++  const params = {
++    Bucket: getConfig("AWS_S3_BUCKET_NAME"),
++    Key: key,
++    ContentType: "application/x-www-form-urlencoded",
++    Expires: 1800 // 30 minutes
++  };
++
++  const result = await s3.getSignedUrl("putObject", params);
++
++  return {
++    data: JSON.stringify({ s3Url: result, s3key: key }),
++    expiresSeconds: 0
++  };
++}
++
++export async function processContactLoad(job, maxContacts, organization) {
++  /// Trigger processing -- this will likely be the most important part
++  /// you should load contacts into the contact table with the job.campaign_id
++  /// Since this might just *begin* the processing and other work might
++  /// need to be completed asynchronously after this is completed (e.g. to distribute loads)
++  /// After true contact-load completion, this (or another function)
++  /// MUST call src/workers/jobs.js::completeContactLoad(job)
++  ///   The async function completeContactLoad(job) will
++  ///      * delete contacts that are in the opt_out table,
++  ///      * delete duplicate cells,
++  ///      * clear/update caching, etc.
++  /// The organization parameter is an object containing the name and other
++  ///   details about the organization on whose behalf this contact load
++  ///   was initiated. It is included here so it can be passed as the
++  ///   second parameter of getConfig in order to retrieve organization-
++  ///   specific configuration values.
++  /// Basic responsibilities:
++  /// 1. Delete previous campaign contacts on a previous choice/upload
++  /// 2. Set campaign_contact.campaign_id = job.campaign_id on all uploaded contacts
++  /// 3. Set campaign_contact.message_status = "needsMessage" on all uploaded contacts
++  /// 4. Ensure that campaign_contact.cell is in the standard phone format "+15551234567"
++  ///    -- do NOT trust your backend to ensure this
++  /// 5. If your source doesn't have timezone offset info already, then you need to
++  ///    fill the campaign_contact.timezone_offset with getTimezoneByZip(contact.zip) (from "../../workers/jobs")
++  /// Things to consider in your implementation:
++  /// * Batching
++  /// * Error handling
++  /// * "Request of Doom" scenarios -- queries or jobs too big to complete
++  const s3 = new AWS.S3({
++    signatureVersion: "v4",
++    region: getConfig("AWS_REGION")
++  });
++  var params = {
++    Bucket: getConfig("AWS_S3_BUCKET_NAME"),
++    Key: job.payload
++  };
++
++  const contactsData = (await s3.getObject(params).promise()).Body.toString(
++    "utf-8"
++  );
++  const contacts = JSON.parse(await gunzip(Buffer.from(contactsData, "base64")))
++    .contacts;
++
++  const contactsCount = contacts.length;
++  await finalizeContactLoad(
++    job,
++    contacts,
++    maxContacts,
++    job.payload,
++    JSON.stringify({ finalCount: contactsCount })
++  );
++}
+diff --git a/src/integrations/contact-loaders/csv-s3-upload/react-component.js b/src/integrations/contact-loaders/csv-s3-upload/react-component.js
+new file mode 100644
+index 00000000..07a94e88
+--- /dev/null
++++ b/src/integrations/contact-loaders/csv-s3-upload/react-component.js
+@@ -0,0 +1,304 @@
++import type from "prop-types";
++import React from "react";
++import RaisedButton from "material-ui/RaisedButton";
++import GSForm from "../../../components/forms/GSForm";
++import Form from "react-formal";
++import Subheader from "material-ui/Subheader";
++import Divider from "material-ui/Divider";
++import { ListItem, List } from "material-ui/List";
++import {
++  parseCSV,
++  gzip,
++  organizationCustomFields,
++  requiredUploadFields
++} from "../../../lib";
++import CampaignFormSectionHeading from "../../../components/CampaignFormSectionHeading";
++import { StyleSheet, css } from "aphrodite";
++import theme from "../../../styles/theme";
++import yup from "yup";
++import humps from "humps";
++import { dataTest } from "../../../lib/attributes";
++import axios from "axios";
++
++export const ensureCamelCaseRequiredHeaders = columnHeader => {
++  /*
++   * This function changes:
++   *  first_name to firstName
++   *  last_name to lastName
++   *  FirstName to firstName
++   *  LastName to lastName
++   *
++   * It changes no other fields.
++   *
++   * If other fields that could be either snake_case or camelCase
++   * are added to `requiredUploadFields` it will do the same for them.
++   * */
++  const camelizedColumnHeader = humps.camelize(columnHeader);
++  if (
++    requiredUploadFields.includes(camelizedColumnHeader) &&
++    camelizedColumnHeader !== columnHeader
++  ) {
++    return camelizedColumnHeader;
++  }
++
++  return columnHeader;
++};
++
++const innerStyles = {
++  button: {
++    margin: "24px 5px 24px 0",
++    fontSize: "10px"
++  },
++  nestedItem: {
++    fontSize: "12px"
++  }
++};
++
++const styles = StyleSheet.create({
++  csvHeader: {
++    fontFamily: "Courier",
++    backgroundColor: theme.colors.lightGray,
++    padding: 3
++  },
++  exampleImageInput: {
++    cursor: "pointer",
++    position: "absolute",
++    top: 0,
++    bottom: 0,
++    right: 0,
++    left: 0,
++    width: "100%",
++    opacity: 0
++  }
++});
++
++export class CampaignContactsForm extends React.Component {
++  state = {
++    uploading: false,
++    validationStats: null,
++    contactUploadError: null
++  };
++
++  handleUpload = event => {
++    event.preventDefault();
++    const file = event.target.files[0];
++    this.setState({ uploading: true }, () => {
++      parseCSV(
++        file,
++        ({ contacts, customFields, validationStats, error }) => {
++          if (error) {
++            this.handleUploadError(error);
++          } else if (contacts.length === 0) {
++            this.handleUploadError("Upload at least one contact");
++          } else if (contacts.length > 0) {
++            this.handleUploadSuccess(validationStats, contacts, customFields);
++          }
++        },
++        { headerTransformer: ensureCamelCaseRequiredHeaders }
++      );
++    });
++  };
++
++  handleUploadError(error) {
++    this.setState({
++      validationStats: null,
++      uploading: false,
++      contactUploadError: error,
++      contacts: null
++    });
++  }
++
++  handleUploadSuccess(validationStats, contacts, customFields) {
++    this.setState({
++      validationStats,
++      customFields,
++      uploading: false,
++      contactUploadError: null,
++      contactsCount: contacts.length
++    });
++    const contactCollection = {
++      contactsCount: contacts.length,
++      customFields,
++      contacts
++    };
++    const self = this;
++
++    const clientData = JSON.parse(this.props.clientChoiceData);
++
++    gzip(JSON.stringify(contactCollection)).then(gzippedData => {
++      const data = gzippedData.toString("base64");
++      axios.put(clientData.s3Url, data).then(res => {
++        self.props.onChange(clientData.s3key);
++      });
++    });
++  }
++
++  renderContactStats() {
++    const { customFields, contactsCount } = this.state;
++
++    if (!contactsCount) {
++      return "";
++    }
++    return (
++      <List>
++        <Subheader>Uploaded</Subheader>
++        <ListItem
++          primaryText={`${contactsCount} contacts`}
++          leftIcon={this.props.icons.check}
++        />
++        <ListItem
++          primaryText={`${customFields.length} custom fields`}
++          leftIcon={this.props.icons.check}
++          nestedItems={customFields.map((field, index) => (
++            <ListItem
++              key={index}
++              innerDivStyle={innerStyles.nestedItem}
++              primaryText={field}
++            />
++          ))}
++        />
++      </List>
++    );
++  }
++
++  renderValidationStats() {
++    if (!this.state.validationStats) {
++      return "";
++    }
++
++    const {
++      dupeCount,
++      missingCellCount,
++      invalidCellCount
++    } = this.state.validationStats;
++
++    let stats = [
++      [dupeCount, "duplicates"],
++      [missingCellCount, "rows with missing numbers"],
++      [invalidCellCount, "rows with invalid numbers"]
++    ];
++    stats = stats
++      .filter(([count]) => count > 0)
++      .map(([count, text]) => `${count} ${text} removed`);
++    return (
++      <List>
++        <Divider />
++        {stats.map((stat, index) => (
++          <ListItem
++            key={index}
++            leftIcon={this.props.icons.warning}
++            innerDivStyle={innerStyles.nestedItem}
++            primaryText={stat}
++          />
++        ))}
++      </List>
++    );
++  }
++
++  renderUploadButton() {
++    const { uploading } = this.state;
++    return (
++      <div>
++        <RaisedButton
++          style={innerStyles.button}
++          label={uploading ? "Uploading..." : "Upload contacts"}
++          labelPosition="before"
++          disabled={uploading}
++          onClick={() => this.uploadButton.click()}
++        />
++        <input
++          id="contact-s3-upload"
++          ref={input => input && (this.uploadButton = input)}
++          type="file"
++          className={css(styles.exampleImageInput)}
++          onChange={this.handleUpload}
++          style={{ display: "none" }}
++        />
++      </div>
++    );
++  }
++
++  renderForm() {
++    const { contactUploadError } = this.state;
++    return (
++      <div>
++        {!this.props.jobResultMessage ? (
++          ""
++        ) : (
++          <div>
++            <CampaignFormSectionHeading title="Job Outcome" />
++            <div>{this.props.jobResultMessage}</div>
++          </div>
++        )}
++        <GSForm
++          schema={yup.object({})}
++          onSubmit={formValues => {
++            this.props.onSubmit();
++          }}
++        >
++          {this.renderUploadButton()}
++          {this.renderContactStats()}
++          {this.renderValidationStats()}
++          {contactUploadError ? (
++            <List>
++              <ListItem
++                id="uploadError"
++                primaryText={contactUploadError}
++                leftIcon={this.props.icons.error}
++              />
++            </List>
++          ) : (
++            ""
++          )}
++          <Form.Button
++            type="submit"
++            disabled={this.props.saveDisabled}
++            label={this.props.saveLabel}
++            {...dataTest("submitContactsCsvUpload")}
++          />
++        </GSForm>
++      </div>
++    );
++  }
++
++  render() {
++    let subtitle = (
++      <span>
++        Your upload file should be in CSV format with column headings in the
++        first row. You must include{" "}
++        <span className={css(styles.csvHeader)}>firstName</span>, (or{" "}
++        <span className={css(styles.csvHeader)}>first_name</span>),
++        <span className={css(styles.csvHeader)}>lastName</span>
++        (or <span className={css(styles.csvHeader)}>last_name</span>), and
++        <span className={css(styles.csvHeader)}>cell</span> columns. If you
++        include a <span className={css(styles.csvHeader)}>zip</span> column,
++        we'll use the zip to guess the contact's timezone for enforcing texting
++        hours. An optional column to map the contact to a CRM is{" "}
++        <span className={css(styles.csvHeader)}>external_id</span>
++        Any additional columns in your file will be available as custom fields
++        to use in your texting scripts.
++      </span>
++    );
++
++    return (
++      <div>
++        {subtitle}
++        {this.renderForm()}
++      </div>
++    );
++  }
++}
++
++CampaignContactsForm.propTypes = {
++  onChange: type.func,
++  onSubmit: type.func,
++  campaignIsStarted: type.bool,
++
++  icons: type.object,
++
++  saveDisabled: type.bool,
++  saveLabel: type.string,
++
++  clientChoiceData: type.string,
++  jobResultMessage: type.string
++};
+-- 
+2.21.0 (Apple Git-122)
+
