@@ -1,0 +1,32 @@
+From 22163af7300ed9ac6f721e4a140fd359d28f59fb Mon Sep 17 00:00:00 2001
+From: Hiemanshu Sharma <hiemanshu@gmail.com>
+Date: Mon, 15 Jun 2020 23:02:11 +0530
+Subject: [PATCH] If sending first message to someone opted out, mark as sent
+
+---
+ src/server/api/mutations/sendMessage.js | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/server/api/mutations/sendMessage.js b/src/server/api/mutations/sendMessage.js
+index 3dc68be7..cc8a4a53 100644
+--- a/src/server/api/mutations/sendMessage.js
++++ b/src/server/api/mutations/sendMessage.js
+@@ -39,6 +39,15 @@ export const sendMessage = async (
+   });
+ 
+   if (optOut) {
++    if (contact.message_status === "needsMessage") {
++      await r
++        .knex("campaign_contact")
++        .where("id", contact.id)
++        .update({
++          message_status: "closed",
++          is_opted_out: true
++        });
++    }
+     throw new GraphQLError({
+       status: 400,
+       message: "Skipped sending because this contact was already opted out"
+-- 
+2.21.0 (Apple Git-122)
+
