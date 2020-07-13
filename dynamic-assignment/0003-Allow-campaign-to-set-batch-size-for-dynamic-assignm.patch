@@ -1,0 +1,132 @@
+From aca61d1b97e50d0174ce6cf82d366f6674a95fe9 Mon Sep 17 00:00:00 2001
+From: Hiemanshu Sharma <hiemanshu@gmail.com>
+Date: Sat, 11 Jul 2020 17:09:28 +0530
+Subject: [PATCH] Allow campaign to set batch size for dynamic assignment
+
+This reverts commit 2d3261ad72ad07f4241274c9de905bead70c34ea.
+---
+ .../AssignmentTexter/ContactController.jsx     |  3 ++-
+ .../CampaignDynamicAssignmentForm.jsx          | 18 +++++++-----------
+ src/containers/TexterTodo.jsx                  |  2 +-
+ src/server/api/campaign.js                     |  2 +-
+ src/server/api/schema.js                       |  4 +++-
+ 5 files changed, 14 insertions(+), 15 deletions(-)
+
+diff --git a/src/components/AssignmentTexter/ContactController.jsx b/src/components/AssignmentTexter/ContactController.jsx
+index 8121d708..c3840d40 100644
+--- a/src/components/AssignmentTexter/ContactController.jsx
++++ b/src/components/AssignmentTexter/ContactController.jsx
+@@ -481,7 +481,8 @@ export class ContactController extends React.Component {
+           You've already messaged or replied to all your contacts for now.
+           <br />
+           <br />
+-          Would you like a new batch of 200 more?
++          Would you like a new batch of{" "}
++          {this.props.assignment.campaign.batchSize} more?
+         </div>
+       </Dialog>
+     );
+diff --git a/src/components/CampaignDynamicAssignmentForm.jsx b/src/components/CampaignDynamicAssignmentForm.jsx
+index 6dfeac29..c9d7d2cf 100644
+--- a/src/components/CampaignDynamicAssignmentForm.jsx
++++ b/src/components/CampaignDynamicAssignmentForm.jsx
+@@ -74,21 +74,16 @@ export default class CampaignDynamicAssignmentForm extends React.Component {
+                   You can turn off dynamic assignment after starting a campaign
+                   to disallow more new texters to join
+                 </li>
+-                <li style={{ display: "none" }}>
+-                  Batch sizes are how many texts someone should send before they
+-                  switch to replying This should be a low number (~50-300) for
+-                  campaigns which expect many replies, and a higher number
+-                  (~100-1000) for campaigns where deliverability of the first
+-                  message is more urgent or important (e.g. Get-Out-The-Vote
+-                  efforts).
+-                </li>
+               </ul>
++              <p>
++                Batch sizes are how many texts someone should send before they
++                switch to replying.
++              </p>
+               <Form.Field
+                 name="batchSize"
+                 type="number"
+                 label="How large should a batch be?"
+-                initialValue={300}
+-                style={{ display: "none" }}
++                initialValue={200}
+               />
+               <Toggle
+                 label="Require texters to request more texts after replies?"
+@@ -121,5 +116,6 @@ CampaignDynamicAssignmentForm.propTypes = {
+   onSubmit: type.func,
+   saveLabel: type.string,
+   saveDisabled: type.bool,
+-  joinToken: type.string
++  joinToken: type.string,
++  batchSize: type.string
+ };
+diff --git a/src/containers/TexterTodo.jsx b/src/containers/TexterTodo.jsx
+index 4367be46..4e6fc8a9 100644
+--- a/src/containers/TexterTodo.jsx
++++ b/src/containers/TexterTodo.jsx
+@@ -256,7 +256,7 @@ const mutations = {
+     `,
+     variables: {
+       assignmentId,
+-      numberContacts: 200
++      numberContacts: ownProps.data.assignment.campaign.batchSize
+     }
+   }),
+   getAssignmentContacts: ownProps => (contactIds, findNew) => ({
+diff --git a/src/server/api/campaign.js b/src/server/api/campaign.js
+index 0d0cff9a..c1b3cf74 100644
+--- a/src/server/api/campaign.js
++++ b/src/server/api/campaign.js
+@@ -280,7 +280,6 @@ export const resolvers = {
+         "id",
+         "title",
+         "description",
+-        "batchSize",
+         "isStarted",
+         "isArchived",
+         "useDynamicAssignment",
+@@ -315,6 +314,7 @@ export const resolvers = {
+       );
+       return campaign.join_token;
+     },
++    batchSize: campaign => campaign.batch_size || 200,
+     organization: async (campaign, _, { loaders }) =>
+       campaign.organization ||
+       loaders.organization.load(campaign.organization_id),
+diff --git a/src/server/api/schema.js b/src/server/api/schema.js
+index 53bbc4a9..8eb00615 100644
+--- a/src/server/api/schema.js
++++ b/src/server/api/schema.js
+@@ -181,6 +181,7 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
+     dueBy,
+     useDynamicAssignment,
+     requestAfterReply,
++    batchSize,
+     logoImageUrl,
+     introHtml,
+     primaryColor,
+@@ -220,6 +221,7 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
+     messageservice_sid: messageserviceSid,
+     use_area_code: useAreaCode,
+     area_codes: areaCodes,
++    batch_size: batchSize,
+     timezone
+   };
+ 
+@@ -732,7 +734,7 @@ const rootMutations = {
+         use_own_messaging_service: true,
+         messageservice_sid: "",
+         join_token: uuidv4(),
+-        batch_size: Number(getConfig("DEFAULT_BATCHSIZE", organization) || 300)
++        batch_size: Number(getConfig("DEFAULT_BATCHSIZE", organization) || 200)
+       });
+       const newCampaign = await campaignInstance.save();
+       await r.knex("campaign_admin").insert({
+-- 
+2.24.3 (Apple Git-128)
+

@@ -1,0 +1,293 @@
+From fd87c87c35622c8516ddb54c0870090ebc0fd246 Mon Sep 17 00:00:00 2001
+From: Hiemanshu Sharma <hiemanshu@gmail.com>
+Date: Tue, 14 Jul 2020 00:58:14 +0530
+Subject: [PATCH] Feedback for dynamic assignment, small features changes
+
+---
+ src/components/AssignmentSummary.jsx          | 31 +++++++---
+ .../AssignmentTexter/ContactController.jsx    | 56 +++++++++++++------
+ .../CampaignDynamicAssignmentForm.jsx         |  2 +-
+ src/containers/TexterTodo.jsx                 | 28 +++++++++-
+ src/containers/TexterTodoList.jsx             |  1 +
+ 5 files changed, 93 insertions(+), 25 deletions(-)
+
+diff --git a/src/components/AssignmentSummary.jsx b/src/components/AssignmentSummary.jsx
+index 2edfe1ef..e879f64b 100644
+--- a/src/components/AssignmentSummary.jsx
++++ b/src/components/AssignmentSummary.jsx
+@@ -2,9 +2,7 @@ import PropTypes from "prop-types";
+ import React, { Component } from "react";
+ import { Card, CardActions, CardTitle } from "material-ui/Card";
+ import { StyleSheet, css } from "aphrodite";
+-import loadData from "../containers/hoc/load-data";
+ import { setContrastingColor } from "../lib/color-contrast-helper";
+-import gql from "graphql-tag";
+ import RaisedButton from "material-ui/RaisedButton";
+ import Badge from "material-ui/Badge";
+ import moment from "moment";
+@@ -113,7 +111,6 @@ export class AssignmentSummary extends Component {
+       unmessagedCount,
+       unrepliedCount,
+       badTimezoneCount,
+-      totalMessagedCount,
+       pastMessagesCount,
+       skippedMessagesCount,
+       secondpassCount
+@@ -130,10 +127,29 @@ export class AssignmentSummary extends Component {
+       useDynamicAssignment,
+       hasSecondPass
+     } = assignment.campaign;
+-    const maxContacts = assignment.maxContacts;
++    const { maxContacts, allContactsCount } = assignment;
+ 
+     const cardTitleTextColor = setContrastingColor(primaryColor);
+ 
++    let sendFirstTitle = "Send First Texts";
++    let sendSecondTitle = "Send Second Pass Texts";
++
++    if (
++      useDynamicAssignment &&
++      allContactsCount !== 0 &&
++      unmessagedCount === 0
++    ) {
++      sendFirstTitle = "Request More";
++    }
++
++    if (
++      useDynamicAssignment &&
++      allContactsCount !== 0 &&
++      secondpassCount !== 0
++    ) {
++      sendSecondTitle = "Request More Second Pass";
++    }
++
+     return (
+       <div
+         className={css(styles.container)}
+@@ -166,13 +182,13 @@ export class AssignmentSummary extends Component {
+               : this.renderBadgedButton({
+                   dataTestText: "sendFirstTexts",
+                   assignment,
+-                  title: "Send first texts",
++                  title: sendFirstTitle,
+                   count: unmessagedCount,
+                   primary: true,
+                   disabled:
+                     (useDynamicAssignment &&
+                       !hasUnassignedContactsForTexter &&
+-                      unmessagedCount == 0) ||
++                      unmessagedCount === 0) ||
+                     (useDynamicAssignment && maxContacts === 0),
+                   contactsFilter: "text",
+                   hideIfZero: !useDynamicAssignment || hasSecondPass
+@@ -191,7 +207,7 @@ export class AssignmentSummary extends Component {
+                 })}
+             {this.renderBadgedButton({
+               assignment,
+-              title: "Send Second Pass texts",
++              title: sendSecondTitle,
+               count: secondpassCount,
+               primary: true,
+               contactsFilter: "secondpass",
+@@ -259,6 +275,7 @@ AssignmentSummary.propTypes = {
+   totalMessagedCount: PropTypes.number,
+   pastMessagesCount: PropTypes.number,
+   skippedMessagesCount: PropTypes.number,
++  secondpassCount: PropTypes.number,
+   data: PropTypes.object,
+   mutations: PropTypes.object
+ };
+diff --git a/src/components/AssignmentTexter/ContactController.jsx b/src/components/AssignmentTexter/ContactController.jsx
+index c3840d40..1ad0a2a8 100644
+--- a/src/components/AssignmentTexter/ContactController.jsx
++++ b/src/components/AssignmentTexter/ContactController.jsx
+@@ -54,7 +54,7 @@ export class ContactController extends React.Component {
+     let startIndex = 0;
+     const contactId = String(document.location).match(/contact=(\d+)/);
+     if (contactId) {
+-      startIndex = this.props.contacts.findIndex(c => c.id == contactId[1]);
++      startIndex = this.props.contacts.findIndex(c => c.id === contactId[1]);
+       if (startIndex === -1) {
+         startIndex = 0;
+       }
+@@ -184,7 +184,7 @@ export class ContactController extends React.Component {
+       this.props.assignment.allContactsCount === 0 &&
+       this.props.assignment.campaign.useDynamicAssignment
+     ) {
+-      this.props.getNewContacts();
++      await this.props.getNewContacts();
+     }
+     if (getIds.length) {
+       // console.log('getContactData length', newIndex, getIds.length)
+@@ -247,6 +247,34 @@ export class ContactController extends React.Component {
+     return this.state.currentContactIndex < this.contactCount() - 1;
+   }
+ 
++  canRequestMore() {
++    const { assignment, messageStatusFilter } = this.props;
++    if (
++      assignment.campaign.useDynamicAssignment &&
++      assignment.campaign.hasUnassignedContactsForTexter
++    ) {
++      if (
++        (messageStatusFilter === "needsMessage" ||
++          messageStatusFilter === "needsSecondPass") &&
++        !assignment.campaign.requestAfterReply
++      ) {
++        return true;
++      } else if (
++        messageStatusFilter === "needsResponse" &&
++        assignment.campaign.requestAfterReply
++      ) {
++        if (
++          assignment.unmessagedCount === 0 &&
++          assignment.unrepliedCount === 0 &&
++          assignment.secondpassCount === 0
++        ) {
++          return true;
++        }
++      }
++    }
++    return false;
++  }
++
+   handleFinishContact = contactId => {
+     if (this.hasNext()) {
+       this.handleNavigateNext();
+@@ -275,17 +303,11 @@ export class ContactController extends React.Component {
+           );
+           // If we still don't have a next item (contacts haven't updated), then give up
+           if (!self.hasNext() && typeof giveUpAction === "function") {
+-            this.giveUpAction = giveUpAction;
+-            if (
+-              ((self.props.messageStatusFilter === "needsMessage" ||
+-                self.props.messageStatusFilter === "needsSecondPass") &&
+-                !self.props.assignment.campaign.requestAfterReply) ||
+-              (self.props.messageStatusFilter === "needsResponse" &&
+-                self.props.assignment.campaign.requestAfterReply)
+-            ) {
++            self.giveUpAction = giveUpAction;
++            if (self.canRequestMore()) {
+               this.setState({ requestDialogOpen: true });
+             } else {
+-              this.giveUpAction();
++              self.giveUpAction();
+             }
+           }
+         });
+@@ -459,8 +481,8 @@ export class ContactController extends React.Component {
+             className={css(styles.button)}
+             label="Request More"
+             primary
+-            onTouchTap={() => {
+-              this.props.getNewContacts();
++            onTouchTap={async () => {
++              await this.props.getNewContacts();
+               this.setState({ requestDialogOpen: false });
+             }}
+           />,
+@@ -488,8 +510,10 @@ export class ContactController extends React.Component {
+     );
+   }
+   renderEmpty() {
+-    const useDynamicAssignment = this.props.assignment.campaign
+-      .useDynamicAssignment;
++    const {
++      useDynamicAssignment,
++      hasUnassignedContactsForTexter
++    } = this.props.assignment.campaign;
+     return (
+       <div>
+         <Empty
+@@ -502,7 +526,7 @@ export class ContactController extends React.Component {
+             />
+           }
+         />
+-        {useDynamicAssignment ? (
++        {useDynamicAssignment && hasUnassignedContactsForTexter ? (
+           <div className={css(styles.requestContainer)}>
+             <h3>Finished sending all your messages, and want to send more?</h3>
+             <RaisedButton
+diff --git a/src/components/CampaignDynamicAssignmentForm.jsx b/src/components/CampaignDynamicAssignmentForm.jsx
+index c9d7d2cf..5aca6a0e 100644
+--- a/src/components/CampaignDynamicAssignmentForm.jsx
++++ b/src/components/CampaignDynamicAssignmentForm.jsx
+@@ -86,7 +86,7 @@ export default class CampaignDynamicAssignmentForm extends React.Component {
+                 initialValue={200}
+               />
+               <Toggle
+-                label="Require texters to request more texts after replies?"
++                label="Require texters to finish replies before requesting more texts?"
+                 toggled={requestAfterReply}
+                 onToggle={(toggler, val) => {
+                   this.toggleChange("requestAfterReply", val);
+diff --git a/src/containers/TexterTodo.jsx b/src/containers/TexterTodo.jsx
+index 4e6fc8a9..737221e0 100644
+--- a/src/containers/TexterTodo.jsx
++++ b/src/containers/TexterTodo.jsx
+@@ -42,9 +42,19 @@ export const contactDataFragment = `
+ `;
+ 
+ export const dataQueryString = `
+-  query getContacts($assignmentId: String!, $contactsFilter: ContactsFilter!, $tagGroup: String) {
++  query getContacts(
++    $assignmentId: String!,
++    $contactsFilter: ContactsFilter!,
++    $tagGroup: String
++    $needsMessageFilter: ContactsFilter
++    $needsResponseFilter: ContactsFilter
++    $secondPassFilter: ContactsFilter
++  ) {
+     assignment(id: $assignmentId) {
+       id
++      unmessagedCount: contactsCount(contactsFilter: $needsMessageFilter)
++      unrepliedCount: contactsCount(contactsFilter: $needsResponseFilter)
++      secondpassCount: contactsCount(contactsFilter: $secondPassFilter)
+       userCannedResponses {
+         id
+         title
+@@ -75,6 +85,7 @@ export const dataQueryString = `
+         textingHoursEnd
+         textingHoursEnforced
+         batchSize
++        hasUnassignedContactsForTexter
+         organization {
+           id
+           tags(group: $tagGroup) {
+@@ -230,6 +241,21 @@ const queries = {
+           isOptedOut: false,
+           validTimezone: true
+         },
++        needsMessageFilter: {
++          messageStatus: "needsMessage",
++          isOptedOut: false,
++          validTimezone: true
++        },
++        needsResponseFilter: {
++          messageStatus: "needsResponse",
++          isOptedOut: false,
++          validTimezone: true
++        },
++        secondPassFilter: {
++          messageStatus: "needsSecondPass",
++          isOptedOut: false,
++          validTimezone: true
++        },
+         assignmentId: ownProps.params.assignmentId,
+         tagGroup: "texter-tags"
+       },
+diff --git a/src/containers/TexterTodoList.jsx b/src/containers/TexterTodoList.jsx
+index 15336a3b..29cb6dd3 100644
+--- a/src/containers/TexterTodoList.jsx
++++ b/src/containers/TexterTodoList.jsx
+@@ -127,6 +127,7 @@ export const dataQuery = gql`
+           logoImageUrl
+         }
+         maxContacts
++        allContactsCount: contactsCount
+         unmessagedCount: contactsCount(contactsFilter: $needsMessageFilter)
+         unrepliedCount: contactsCount(contactsFilter: $needsResponseFilter)
+         badTimezoneCount: contactsCount(contactsFilter: $badTimezoneFilter)
+-- 
+2.24.3 (Apple Git-128)
+

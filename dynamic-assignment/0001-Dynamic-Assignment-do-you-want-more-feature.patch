@@ -1,0 +1,453 @@
+From 6f42a4392edf3299de8d0580be9c7931036e2181 Mon Sep 17 00:00:00 2001
+From: Hiemanshu Sharma <hiemanshu@gmail.com>
+Date: Sat, 11 Jul 2020 15:00:39 +0530
+Subject: [PATCH] Dynamic Assignment, do you want more? feature
+
+---
+ ...0711000245_campaign_request_after_reply.js | 11 +++
+ src/api/campaign.js                           |  1 +
+ src/api/schema.js                             |  1 +
+ .../AssignmentTexter/ContactController.jsx    | 88 +++++++++++++++++--
+ .../CampaignDynamicAssignmentForm.jsx         | 38 ++++----
+ src/containers/AdminCampaignEdit.jsx          |  3 +-
+ src/containers/TexterTodo.jsx                 | 47 +++++-----
+ src/server/api/campaign.js                    |  1 +
+ src/server/api/schema.js                      |  4 +-
+ src/server/models/campaign.js                 |  3 +-
+ 10 files changed, 141 insertions(+), 56 deletions(-)
+ create mode 100644 migrations/20200711000245_campaign_request_after_reply.js
+
+diff --git a/migrations/20200711000245_campaign_request_after_reply.js b/migrations/20200711000245_campaign_request_after_reply.js
+new file mode 100644
+index 00000000..bdea48b8
+--- /dev/null
++++ b/migrations/20200711000245_campaign_request_after_reply.js
+@@ -0,0 +1,11 @@
++exports.up = function(knex) {
++  return knex.schema.table("campaign", table => {
++    table.boolean("request_after_reply").defaultTo(false);
++  });
++};
++
++exports.down = function(knex) {
++  return knex.schema.table("campaign", table => {
++    table.dropColumn("request_after_reply");
++  });
++};
+diff --git a/src/api/campaign.js b/src/api/campaign.js
+index cc548c80..9f931075 100644
+--- a/src/api/campaign.js
++++ b/src/api/campaign.js
+@@ -106,6 +106,7 @@ export const schema = gql`
+     ingestMethodsAvailable: [IngestMethod]
+     ingestMethod: IngestMethod
+     useDynamicAssignment: Boolean
++    requestAfterReply: Boolean
+     introHtml: String
+     primaryColor: String
+     logoImageUrl: String
+diff --git a/src/api/schema.js b/src/api/schema.js
+index 63f060d6..eb1ac7f4 100644
+--- a/src/api/schema.js
++++ b/src/api/schema.js
+@@ -70,6 +70,7 @@ const rootSchema = gql`
+     primaryColor: String
+     introHtml: String
+     useDynamicAssignment: Boolean
++    requestAfterReply: Boolean
+     batchSize: Int
+     ingestMethod: String
+     contactData: String
+diff --git a/src/components/AssignmentTexter/ContactController.jsx b/src/components/AssignmentTexter/ContactController.jsx
+index 479e31d3..8121d708 100644
+--- a/src/components/AssignmentTexter/ContactController.jsx
++++ b/src/components/AssignmentTexter/ContactController.jsx
+@@ -1,12 +1,13 @@
+ import PropTypes from "prop-types";
++import theme from "../../styles/theme";
+ import React from "react";
+-import IconButton from "material-ui/IconButton/IconButton";
+ import LoadingIndicator from "../LoadingIndicator";
+ import { StyleSheet, css } from "aphrodite";
+ import { withRouter } from "react-router";
+ import Check from "material-ui/svg-icons/action/check-circle";
+ import Empty from "../Empty";
+ import RaisedButton from "material-ui/RaisedButton";
++import Dialog from "material-ui/Dialog";
+ 
+ const styles = StyleSheet.create({
+   container: {
+@@ -20,6 +21,18 @@ const styles = StyleSheet.create({
+     zIndex: 1002,
+     backgroundColor: "white",
+     overflow: "hidden"
++  },
++  requestContainer: {
++    ...theme.text.header,
++    marginTop: "50px",
++    width: 500,
++    marginLeft: "auto",
++    marginRight: "auto",
++    textAlign: "center"
++  },
++  button: {
++    marginLeft: "10px",
++    marginRight: "10px"
+   }
+ });
+ 
+@@ -32,7 +45,8 @@ export class ContactController extends React.Component {
+       contactCache: {},
+       loading: false,
+       direction: "right",
+-      reloadDelay: 200
++      reloadDelay: 200,
++      requestDialogOpen: false
+     };
+   }
+ 
+@@ -167,10 +181,8 @@ export class ContactController extends React.Component {
+       // console.log('getContactData batch forward ', getIds)
+     } else if (
+       !getIds.length &&
+-      this.props.assignment.campaign.useDynamicAssignment &&
+-      // If we have just crossed the threshold of contact data we have, get more
+-      contacts[newIndex + BATCH_FORWARD - 1] &&
+-      !contacts[newIndex + BATCH_FORWARD]
++      this.props.assignment.allContactsCount === 0 &&
++      this.props.assignment.campaign.useDynamicAssignment
+     ) {
+       this.props.getNewContacts();
+     }
+@@ -263,7 +275,18 @@ export class ContactController extends React.Component {
+           );
+           // If we still don't have a next item (contacts haven't updated), then give up
+           if (!self.hasNext() && typeof giveUpAction === "function") {
+-            giveUpAction();
++            this.giveUpAction = giveUpAction;
++            if (
++              ((self.props.messageStatusFilter === "needsMessage" ||
++                self.props.messageStatusFilter === "needsSecondPass") &&
++                !self.props.assignment.campaign.requestAfterReply) ||
++              (self.props.messageStatusFilter === "needsResponse" &&
++                self.props.assignment.campaign.requestAfterReply)
++            ) {
++              this.setState({ requestDialogOpen: true });
++            } else {
++              this.giveUpAction();
++            }
+           }
+         });
+     }
+@@ -427,7 +450,45 @@ export class ContactController extends React.Component {
+       />
+     );
+   }
++  renderDialog() {
++    return (
++      <Dialog
++        title="Request more texts?"
++        actions={[
++          <RaisedButton
++            className={css(styles.button)}
++            label="Request More"
++            primary
++            onTouchTap={() => {
++              this.props.getNewContacts();
++              this.setState({ requestDialogOpen: false });
++            }}
++          />,
++          <RaisedButton
++            className={css(styles.button)}
++            label="Done For Now"
++            primary
++            onTouchTap={() => {
++              this.setState({ requestDialogOpen: false });
++              this.giveUpAction();
++            }}
++          />
++        ]}
++        modal
++        open={this.state.requestDialogOpen}
++      >
++        <div>
++          You've already messaged or replied to all your contacts for now.
++          <br />
++          <br />
++          Would you like a new batch of 200 more?
++        </div>
++      </Dialog>
++    );
++  }
+   renderEmpty() {
++    const useDynamicAssignment = this.props.assignment.campaign
++      .useDynamicAssignment;
+     return (
+       <div>
+         <Empty
+@@ -440,6 +501,18 @@ export class ContactController extends React.Component {
+             />
+           }
+         />
++        {useDynamicAssignment ? (
++          <div className={css(styles.requestContainer)}>
++            <h3>Finished sending all your messages, and want to send more?</h3>
++            <RaisedButton
++              label="Request More"
++              primary
++              onClick={() => this.props.getNewContacts()}
++            />
++          </div>
++        ) : (
++          ""
++        )}
+       </div>
+     );
+   }
+@@ -447,6 +520,7 @@ export class ContactController extends React.Component {
+     const { contacts } = this.props;
+     return (
+       <div className={css(styles.container)}>
++        {this.renderDialog()}
+         {contacts.length === 0 ? this.renderEmpty() : this.renderTexter()}
+       </div>
+     );
+diff --git a/src/components/CampaignDynamicAssignmentForm.jsx b/src/components/CampaignDynamicAssignmentForm.jsx
+index a8566450..6dfeac29 100644
+--- a/src/components/CampaignDynamicAssignmentForm.jsx
++++ b/src/components/CampaignDynamicAssignmentForm.jsx
+@@ -1,21 +1,12 @@
+ import type from "prop-types";
+ import React from "react";
+-import orderBy from "lodash/orderBy";
+-import Slider from "./Slider";
+-import AutoComplete from "material-ui/AutoComplete";
+-import IconButton from "material-ui/IconButton";
+-import RaisedButton from "material-ui/RaisedButton";
+ import GSForm from "../components/forms/GSForm";
+ import yup from "yup";
+ import Form from "react-formal";
+ import OrganizationJoinLink from "./OrganizationJoinLink";
+-import CampaignFormSectionHeading from "./CampaignFormSectionHeading";
+-import { StyleSheet, css } from "aphrodite";
+-import theme from "../styles/theme";
+ import Toggle from "material-ui/Toggle";
+-import DeleteIcon from "material-ui/svg-icons/action/delete";
+ import { dataTest } from "../lib/attributes";
+-import { dataSourceItem } from "./utils";
++import cloneDeep from "lodash/cloneDeep";
+ 
+ export default class CampaignDynamicAssignmentForm extends React.Component {
+   state = {
+@@ -30,22 +21,26 @@ export default class CampaignDynamicAssignmentForm extends React.Component {
+     });
+   };
+ 
+-  toggleChange = (toggler, useDynamicAssignment) => {
+-    this.setState({ useDynamicAssignment });
++  toggleChange = (key, val) => {
++    this.setState({ [key]: val });
++
++    const formValues = cloneDeep(this.props.formValues);
++    formValues[key] = val;
++
+     this.props.onChange({
+       ...this.state,
+-      useDynamicAssignment
++      ...formValues
+     });
+   };
+ 
+   formSchema = yup.object({
+-    batchSize: yup.number().integer()
++    batchSize: yup.number().integer(),
++    requestAfterReply: yup.boolean()
+   });
+ 
+   render() {
+     const { joinToken, campaignId } = this.props;
+-    const { useDynamicAssignment } = this.state;
+-    const subtitle = useDynamicAssignment ? <div></div> : "";
++    const { useDynamicAssignment, requestAfterReply } = this.state;
+ 
+     return (
+       <div>
+@@ -53,7 +48,9 @@ export default class CampaignDynamicAssignmentForm extends React.Component {
+           {...dataTest("useDynamicAssignment")}
+           label="Allow texters with a link to join and start texting when the campaign is started?"
+           toggled={useDynamicAssignment}
+-          onToggle={this.toggleChange}
++          onToggle={(toggler, val) =>
++            this.toggleChange("useDynamicAssignment", val)
++          }
+         />
+         <GSForm
+           schema={this.formSchema}
+@@ -93,6 +90,13 @@ export default class CampaignDynamicAssignmentForm extends React.Component {
+                 initialValue={300}
+                 style={{ display: "none" }}
+               />
++              <Toggle
++                label="Require texters to request more texts after replies?"
++                toggled={requestAfterReply}
++                onToggle={(toggler, val) => {
++                  this.toggleChange("requestAfterReply", val);
++                }}
++              />
+             </div>
+           )}
+           <Form.Button
+diff --git a/src/containers/AdminCampaignEdit.jsx b/src/containers/AdminCampaignEdit.jsx
+index 766d1b81..5826ca51 100644
+--- a/src/containers/AdminCampaignEdit.jsx
++++ b/src/containers/AdminCampaignEdit.jsx
+@@ -42,6 +42,7 @@ const campaignInfoFragment = `
+   contactsCount
+   customFields
+   useDynamicAssignment
++  requestAfterReply
+   logoImageUrl
+   introHtml
+   primaryColor
+@@ -515,7 +516,7 @@ export class AdminCampaignEdit extends React.Component {
+       {
+         title: "Dynamic Assignment",
+         content: CampaignDynamicAssignmentForm,
+-        keys: ["batchSize", "useDynamicAssignment"],
++        keys: ["batchSize", "useDynamicAssignment", "requestAfterReply"],
+         checkCompleted: () => true,
+         blocksStarting: false,
+         expandAfterCampaignStarts: true,
+diff --git a/src/containers/TexterTodo.jsx b/src/containers/TexterTodo.jsx
+index 52ccc64b..d690ec75 100644
+--- a/src/containers/TexterTodo.jsx
++++ b/src/containers/TexterTodo.jsx
+@@ -68,6 +68,7 @@ export const dataQueryString = `
+         title
+         isArchived
+         useDynamicAssignment
++        requestAfterReply
+         overrideOrganizationTextingHours
+         timezone
+         textingHoursStart
+@@ -133,33 +134,6 @@ export class TexterTodo extends React.Component {
+     }
+   }
+ 
+-  assignContactsIfNeeded = async (checkServer = false, currentIndex) => {
+-    const { assignment } = this.props.data;
+-    // TODO: should we assign a single contact at first, and then afterwards assign 10
+-    //       to avoid people loading up the screen but doing nothing -- then they've 'taken' only one contact
+-    if (
+-      !this.loadingNewContacts &&
+-      assignment &&
+-      (assignment.contacts.length === 0 || checkServer)
+-    ) {
+-      const didAddContacts = await this.getNewContacts(
+-        checkServer,
+-        currentIndex
+-      );
+-      if (didAddContacts) {
+-        return;
+-      }
+-      // FUTURE: we might check if currentIndex is really at the end now that we've updated
+-      console.log("Are we empty?", checkServer, currentIndex);
+-      const self = this;
+-      return () => {
+-        self.props.router.push(
+-          `/app/${self.props.params.organizationId}/todos`
+-        );
+-      };
+-    }
+-  };
+-
+   getNewContacts = async (waitForServer = false, currentIndex) => {
+     const { assignment } = this.props.data;
+     if (assignment.campaign.useDynamicAssignment) {
+@@ -182,6 +156,25 @@ export class TexterTodo extends React.Component {
+     }
+   };
+ 
++  assignContactsIfNeeded = async (checkServer = false, currentIndex) => {
++    const { assignment } = this.props.data;
++    // TODO: should we assign a single contact at first, and then afterwards assign 10
++    //       to avoid people loading up the screen but doing nothing -- then they've 'taken' only one contact
++    if (
++      !this.loadingNewContacts &&
++      assignment &&
++      (assignment.contacts.length === 0 || checkServer)
++    ) {
++      // FUTURE: we might check if currentIndex is really at the end now that we've updated
++      const self = this;
++      return () => {
++        self.props.router.push(
++          `/app/${self.props.params.organizationId}/todos`
++        );
++      };
++    }
++  };
++
+   loadContacts = async contactIds => {
+     this.loadingAssignmentContacts = true;
+     const newContacts = await this.props.mutations.getAssignmentContacts(
+diff --git a/src/server/api/campaign.js b/src/server/api/campaign.js
+index 00144bbb..0d0cff9a 100644
+--- a/src/server/api/campaign.js
++++ b/src/server/api/campaign.js
+@@ -284,6 +284,7 @@ export const resolvers = {
+         "isStarted",
+         "isArchived",
+         "useDynamicAssignment",
++        "requestAfterReply",
+         "introHtml",
+         "primaryColor",
+         "logoImageUrl",
+diff --git a/src/server/api/schema.js b/src/server/api/schema.js
+index d8cb7bfa..53bbc4a9 100644
+--- a/src/server/api/schema.js
++++ b/src/server/api/schema.js
+@@ -180,11 +180,10 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
+     description,
+     dueBy,
+     useDynamicAssignment,
+-    batchSize,
++    requestAfterReply,
+     logoImageUrl,
+     introHtml,
+     primaryColor,
+-    useOwnMessagingService,
+     useAreaCode,
+     areaCodes,
+     messageserviceSid,
+@@ -209,6 +208,7 @@ async function editCampaign(id, campaign, loaders, user, origCampaignRecord) {
+     description,
+     due_by: dueBy,
+     use_dynamic_assignment: useDynamicAssignment,
++    request_after_reply: requestAfterReply,
+     logo_image_url: logoImageUrl,
+     primary_color: primaryColor,
+     intro_html: introHtml,
+diff --git a/src/server/models/campaign.js b/src/server/models/campaign.js
+index d0565f4a..4e60c88a 100644
+--- a/src/server/models/campaign.js
++++ b/src/server/models/campaign.js
+@@ -2,8 +2,6 @@ import thinky from "./thinky";
+ const type = thinky.type;
+ import { requiredString, optionalString, timestamp } from "./custom-types";
+ 
+-import Organization from "./organization";
+-
+ const Campaign = thinky.createModel(
+   "campaign",
+   type
+@@ -33,6 +31,7 @@ const Campaign = thinky.createModel(
+       primary_color: type.string(),
+       use_own_messaging_service: type.boolean().required(),
+       use_area_code: type.boolean().required(),
++      request_after_reply: type.boolean().required(),
+       area_codes: type.string(),
+       messageservice_sid: type.string().required(),
+       has_second_pass: type.boolean(),
+-- 
+2.24.3 (Apple Git-128)
+
